@@ -1,11 +1,12 @@
-name: CI/CD for Flask App (Blue-Green Deployment)
+name: CI/CD for PHP CRM (Blue-Green)
 
 on:
   push:
     branches:
-      - main  # Trigger pipeline on push to main branch
+      - main
 
 jobs:
+
   build-and-push:
     runs-on: ubuntu-latest
 
@@ -19,104 +20,151 @@ jobs:
       - name: Login to Docker Hub
         run: echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
 
-      - name: Build and Push Docker Image
+      - name: Build and Push Docker Images
         run: |
-          docker build -t ${{ secrets.DOCKER_USERNAME }}/flask-attendance-app .
-          docker push ${{ secrets.DOCKER_USERNAME }}/flask-attendance-app
+          docker build -t ${{ secrets.DOCKER_USERNAME }}/php-nginx:latest -f Dockerfile .
+          docker push ${{ secrets.DOCKER_USERNAME }}/php-nginx:latest
+
+          docker build -t ${{ secrets.DOCKER_USERNAME }}/php-web:latest -f php.Dockerfile .
+          docker push ${{ secrets.DOCKER_USERNAME }}/php-web:latest
 
   deploy:
     runs-on: ubuntu-latest
     needs: build-and-push
 
     steps:
+
       - name: Checkout Code
         uses: actions/checkout@v3
 
-      - name: Deploy to AWS EC2 (Blue-Green Deployment)
+      - name: Setup SSH Key
         run: |
-          echo "${{ secrets.AWS_KEY }}" > private_key.pem
+          echo "${{ secrets.SERVER_SSH_KEY }}" > private_key.pem
           chmod 600 private_key.pem
 
-          ssh -o StrictHostKeyChecking=no -i private_key.pem ${{ secrets.AWS_USER }}@${{ secrets.AWS_HOST }} << EOF
+      - name: Copy database.sql to Server
+        run: |
+          scp -o StrictHostKeyChecking=no -i private_key.pem -P 54658 \
+            database.sql ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }}:/home/${{ secrets.SERVER_USER }}/app/database.sql
 
-            # Ensure Docker network exists
-            docker network create app_network || true
+      - name: Deploy to Server (Blue-Green)
+        run: |
+          ssh -o StrictHostKeyChecking=no -i private_key.pem -p 54658 ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'EOF'
+          set -euo pipefail
 
-            # Ensure MySQL is running - starts once, doesn't restart on app deployment
-            if ! docker ps --filter "name=mysql-db" | grep mysql-db; then
-              docker run -d \
-                --name mysql-db \
-                --network app_network \
-                -e MYSQL_ROOT_PASSWORD=root \
-                -e MYSQL_DATABASE=attendance_db \
-                -p 3306:3306 \
-                mysql:latest
+          echo "=== DEPLOYMENT STARTED ON \$(hostname) ==="
 
-              echo "Waiting for MySQL to initialize..."
-              sleep 30
+          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+
+          mkdir -p /home/${{ secrets.SERVER_USER }}/app
+
+          sudo docker network create app_network || true
+
+          ############################################
+          # 1. Determine CURRENT ACTIVE color (blue/green)
+          ############################################
+          ACTIVE_COLOR="blue"
+          if sudo docker ps --format '{{.Names}}' | grep -q "php-web-blue"; then
+            ACTIVE_COLOR="blue"
+          fi
+          if sudo docker ps --format '{{.Names}}' | grep -q "php-web-green"; then
+            ACTIVE_COLOR="green"
+          fi
+
+          echo "Active color: \$ACTIVE_COLOR"
+
+          if [ "\$ACTIVE_COLOR" == "blue" ]; then
+            NEW_COLOR="green"
+          else
+            NEW_COLOR="blue"
+          fi
+
+          echo "Deploying NEW color: \$NEW_COLOR"
+
+          ############################################
+          # 2. Ensure MySQL is running
+          ############################################
+          sudo docker rm -f mysql-db || true
+          sudo docker run -d --name mysql-db --network app_network \
+            -v db_data:/var/lib/mysql \
+            -v /home/${{ secrets.SERVER_USER }}/app/database.sql:/docker-entrypoint-initdb.d/database.sql:ro \
+            -e MYSQL_ROOT_PASSWORD=pass@321 \
+            -e MYSQL_DATABASE=student_enrollment \
+            -p 3306:3306 \
+            --restart unless-stopped \
+            mysql:8.0.35
+
+          echo "Waiting for MySQL to initialize..."
+          for i in {1..30}; do
+            if sudo docker exec mysql-db mysql -u root -ppass@321 -e "SELECT 1;" >/dev/null 2>&1; then
+              echo "MySQL ready!"
+              break
             fi
+            echo "Waiting for MySQL (\$i/30)..."
+            sleep 5
+          done
 
-            # Health check loop to make sure MySQL is fully up
-            echo "Waiting for MySQL to become available..."
-            until docker exec mysql-db mysqladmin ping -h "localhost" --silent; do
-                echo "MySQL is not ready yet, retrying..."
-                sleep 15
-            done
-            echo "MySQL is ready, up and running"
+          ############################################
+          # 3. Start NEW Blue/Green containers
+          ############################################
+          echo "Starting php-web-\$NEW_COLOR ..."
 
-            # Determine current active and idle containers
-            if docker ps --filter "name=flask-app-blue" | grep flask-app-blue; then
-                ACTIVE_COLOR="blue"
-                IDLE_COLOR="green"
-                IDLE_PORT=5001
-            elif docker ps --filter "name=flask-app-green" | grep flask-app-green; then
-                ACTIVE_COLOR="green"
-                IDLE_COLOR="blue"
-                IDLE_PORT=5000
-            else
-                # First deployment case (default to blue)
-                ACTIVE_COLOR="none"
-                IDLE_COLOR="blue"
-                IDLE_PORT=5000
-            fi
+          sudo docker rm -f php-web-\$NEW_COLOR || true
+          sudo docker run -d --name php-web-\$NEW_COLOR --network app_network \
+            -e DB_HOST=mysql-db \
+            -e DB_USER=root \
+            -e DB_PASSWORD=pass@321 \
+            -e DB_NAME=student_enrollment \
+            --restart unless-stopped \
+            ${{ secrets.DOCKER_USERNAME }}/php-web:latest
 
-            echo "Active Color: \$ACTIVE_COLOR"
-            echo "Deploying to: \$IDLE_COLOR on port \$IDLE_PORT"
+          echo "Starting php-nginx-\$NEW_COLOR ..."
 
-            # Authenticate and pull the new image
-            docker login -u ${{ secrets.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
-            docker pull ${{ secrets.DOCKER_USERNAME }}/flask-attendance-app
+          sudo docker rm -f php-nginx-\$NEW_COLOR || true
+          sudo docker run -d --name php-nginx-\$NEW_COLOR --network app_network \
+            -p 8080:80 \
+            --restart unless-stopped \
+            ${{ secrets.DOCKER_USERNAME }}/php-nginx:latest
 
-            # Stop and remove the old idle container if it exists
-            docker stop flask-app-\$IDLE_COLOR || true
-            docker rm flask-app-\$IDLE_COLOR || true
+          ############################################
+          # 4. HEALTH CHECK NEW ENV
+          ############################################
+          echo "Health checking new environment…"
+          sleep 10
 
-            # Run new Flask app in idle slot
-            docker run -d \
-              --name flask-app-\$IDLE_COLOR \
-              --network app_network \
-              -p \$IDLE_PORT:5000 \
-              -e DB_HOST=mysql-db \
-              -e DB_USER=root \
-              -e DB_PASSWORD=root \
-              -e DB_NAME=attendance_db \
-              ${{ secrets.DOCKER_USERNAME }}/flask-attendance-app
+          if ! curl -f http://localhost:8080 >/dev/null 2>&1; then
+            echo "❌ New (\$NEW_COLOR) environment failed! Rolling back."
+            sudo docker logs php-web-\$NEW_COLOR || true
+            sudo docker rm -f php-web-\$NEW_COLOR php-nginx-\$NEW_COLOR
+            exit 1
+          fi
 
-            echo "Successfully deployed to \$IDLE_COLOR"
+          echo "✅ New environment healthy!"
 
-            # Switch NGINX to new idle port
-            echo "Updating NGINX to point to port $IDLE_PORT"
-            sudo sed -i "s|localhost:[0-9]*|localhost:$IDLE_PORT|g" /etc/nginx/conf.d/bluegreen.conf
-            sudo nginx -s reload
+          ############################################
+          # 5. SWITCH TRAFFIC (Zero Downtime)
+          ############################################
+          echo "Switching traffic to NEW color: \$NEW_COLOR"
 
+          sudo docker rm -f php-nginx || true
+          sudo docker run -d --name php-nginx --network app_network \
+            -p 80:80 \
+            --restart unless-stopped \
+            --link php-web-\$NEW_COLOR:php \
+            ${{ secrets.DOCKER_USERNAME }}/php-nginx:latest
 
-            echo "Traffic switched to \$IDLE_COLOR"
+          ############################################
+          # 6. STOP OLD CONTAINERS (Safe Cleanup)
+          ############################################
+          echo "Stopping old (\$ACTIVE_COLOR) containers…"
 
-            # Optionally remove old active container (optional cleanup step, can be skipped for rollback flexibility)
-            if [ "\$ACTIVE_COLOR" != "none" ]; then
-                docker stop flask-app-\$ACTIVE_COLOR || true
-                docker rm flask-app-\$ACTIVE_COLOR || true
-                echo "Removed old \$ACTIVE_COLOR container"
-            fi
+          sudo docker rm -f php-web-\$ACTIVE_COLOR php-nginx-\$ACTIVE_COLOR || true
+
+          ############################################
+          # 7. Verify final state
+          ############################################
+          sudo docker ps -a
+
+          echo "=== BLUE-GREEN DEPLOYMENT COMPLETED SUCCESSFULLY ==="
 
           EOF
